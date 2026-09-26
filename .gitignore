@@ -6,3 +6,6 @@ datasets/
 .vscode/
 
 __pycache__/
+
+student_resource
+output

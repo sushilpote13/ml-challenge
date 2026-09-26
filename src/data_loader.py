@@ -2,7 +2,8 @@ from pathlib import Path
 import pandas as pd
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-BASE = REPO_ROOT / "datasets" / "student_resource" / "student_resource" / "dataset"
+# BASE = REPO_ROOT / "datasets" / "student_resource" / "student_resource" / "dataset"
+BASE = REPO_ROOT / "student_resource" / "dataset"
 
 TRAIN_S1 = BASE / "train" / "train_source1.tsv"
 TRAIN_S2 = BASE / "train" / "train_source2.tsv"

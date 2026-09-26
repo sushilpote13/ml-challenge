@@ -1,5 +1,5 @@
-from candidate_generator import generate_train_candidate_pairs
-
+# from candidate_generator import generate_train_candidate_pairs
+from src.candidate_generator import generate_train_candidate_pairs
 OUTPUT = "output/candidate_pairs_train.tsv"
 BATCH_SIZE = 25000
 MAX_BLOCK_SIZE = 5000

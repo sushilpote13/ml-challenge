@@ -165,57 +165,90 @@ def build_tfidf(names, label):
     return TfidfSide(vec, mat)
 
 
-def tfidf_topk_for_batch(side, query_names, top_k, min_similarity, query_batch=2000):
-    out = [[] for _ in query_names]
-    if side is None or top_k <= 0 or not query_names:
-        return out
-    for start in range(0, len(query_names), query_batch):
-        sub = query_names[start:start + query_batch]
-        Q = side.vectorizer.transform(sub)
-        if Q.nnz == 0:
-            continue
-        S = (Q @ side.matrix.T).tocsr()
-        indptr, indices, data = S.indptr, S.indices, S.data
-        for i in range(S.shape[0]):
-            s, e = indptr[i], indptr[i + 1]
-            if s == e:
-                continue
-            ridx, rdata = indices[s:e], data[s:e]
-            mask = rdata >= min_similarity
-            if not np.any(mask):
-                continue
-            ridx, rdata = ridx[mask], rdata[mask]
-            if len(ridx) > top_k:
-                part = np.argpartition(-rdata, top_k - 1)[:top_k]
-                part = part[np.argsort(-rdata[part], kind="stable")]
-                ridx = ridx[part]
-            else:
-                ridx = ridx[np.argsort(-rdata, kind="stable")]
-            out[start + i] = ridx.tolist()
-    return out
+def tfidf_topk_restricted(side, q_vec, cand_positions, top_k, min_similarity):
+    """Memory-safe TF-IDF top-k restricted to a blocking candidate pool.
+
+    Scores a single query row against only ``cand_positions`` rows of
+    ``side.matrix``: ``q (1xF) @ Cand (CxF).T -> (1xC)``. The dense output
+    is size C (pool size, manageable) instead of N (full side, huge).
+    Returns candidate positions ordered by similarity desc.
+    """
+    if side is None or top_k <= 0 or not cand_positions:
+        return []
+    if q_vec is None or q_vec.nnz == 0:
+        return []
+    cand_list = sorted(cand_positions)  # deterministic row alignment
+    sub = side.matrix[cand_list]  # C x F, transient per-row copy
+    scores = (q_vec @ sub.T).toarray().ravel()  # dense C
+    mask = scores >= min_similarity
+    if not np.any(mask):
+        return []
+    idx = np.flatnonzero(mask)
+    if len(idx) > top_k:
+        part = np.argpartition(-scores[idx], top_k - 1)[:top_k]
+        part = part[np.argsort(-scores[idx][part], kind="stable")]
+        idx = idx[part]
+    else:
+        idx = idx[np.argsort(-scores[idx], kind="stable")]
+    return [cand_list[j] for j in idx.tolist()]
 
 
 def batch_rows(batch, idx2, idx3, rules, min_name_len, min_addr_len, max_per_s1, tf2=None, tf3=None, tfidf_top_k=20, tfidf_min_similarity=0.55, tfidf_query_batch=2000):
     names = [n if isinstance(n, str) else "" for n in batch["name_norm"].tolist()]
-    t2 = tfidf_topk_for_batch(tf2, names, tfidf_top_k, tfidf_min_similarity, tfidf_query_batch) if tf2 is not None else None
-    t3 = tfidf_topk_for_batch(tf3, names, tfidf_top_k, tfidf_min_similarity, tfidf_query_batch) if tf3 is not None else None
-    rows = []
-    for i, row in enumerate(batch.itertuples(index=False)):
-        s1_id = row.entity_id
-        nn = row.name_norm if isinstance(row.name_norm, str) else ""
-        nc = row.name_compact if isinstance(row.name_compact, str) else ""
-        an = row.addr_norm if isinstance(row.addr_norm, str) else ""
-        co = norm_country(row.country)
-        h2 = candidates_for_row(nn, nc, an, co, idx2, rules, min_name_len, min_addr_len)
-        h3 = candidates_for_row(nn, nc, an, co, idx3, rules, min_name_len, min_addr_len)
-        if t2 is not None:
-            h2 = h2 | set(t2[i])
-        if t3 is not None:
-            h3 = h3 | set(t3[i])
-        cands = sorted({idx2.ids[p] for p in h2} | {idx3.ids[p] for p in h3})
-        if len(cands) > max_per_s1:
-            cands = cands[:max_per_s1]  # sorted -> deterministic
-        rows.append((s1_id, cands))
+    # Materialize row fields once so sub-batching below stays aligned.
+    recs = []
+    for row in batch.itertuples(index=False):
+        recs.append((
+            row.entity_id,
+            row.name_norm if isinstance(row.name_norm, str) else "",
+            row.name_compact if isinstance(row.name_compact, str) else "",
+            row.addr_norm if isinstance(row.addr_norm, str) else "",
+            norm_country(row.country),
+        ))
+    rows = [None] * len(recs)
+    use_tfidf = (tf2 is not None or tf3 is not None) and tfidf_top_k > 0
+    qb = max(1, int(tfidf_query_batch))
+    for start in range(0, len(recs), qb):
+        end = min(len(recs), start + qb)
+        sub_names = names[start:end]
+        Q2 = tf2.vectorizer.transform(sub_names) if tf2 is not None else None
+        Q3 = tf3.vectorizer.transform(sub_names) if tf3 is not None else None
+        for j in range(start, end):
+            s1_id, nn, nc, an, co = recs[j]
+            h2 = candidates_for_row(nn, nc, an, co, idx2, rules, min_name_len, min_addr_len)
+            h3 = candidates_for_row(nn, nc, an, co, idx3, rules, min_name_len, min_addr_len)
+            all_ids = {idx2.ids[p] for p in h2} | {idx3.ids[p] for p in h3}
+            if use_tfidf and all_ids:
+                k = j - start
+                # TF-IDF scored ONLY within the blocking pools (no global Q@T).
+                t2 = tfidf_topk_restricted(tf2, Q2[k], h2, tfidf_top_k, tfidf_min_similarity) if tf2 is not None else []
+                t3 = tfidf_topk_restricted(tf3, Q3[k], h3, tfidf_top_k, tfidf_min_similarity) if tf3 is not None else []
+                if t2 or t3:
+                    # Priority (similarity-ordered) used when truncating to max_per_s1.
+                    prio, seen = [], set()
+                    for p in t2:
+                        eid = idx2.ids[p]
+                        if eid not in seen:
+                            seen.add(eid)
+                            prio.append(eid)
+                    for p in t3:
+                        eid = idx3.ids[p]
+                        if eid not in seen:
+                            seen.add(eid)
+                            prio.append(eid)
+                    if len(all_ids) > max_per_s1:
+                        rest = sorted(all_ids - seen)
+                        rows[j] = (s1_id, (prio + rest)[:max_per_s1])
+                        continue
+            cands = sorted(all_ids)
+            if len(cands) > max_per_s1:
+                # No TF-IDF priority available: deterministic sorted truncation.
+                # With TF-IDF priority available this branch is unreachable
+                # (handled above), keeping blocking recall otherwise.
+                cands = cands[:max_per_s1]
+            rows[j] = (s1_id, cands)
+        del Q2, Q3
+        gc.collect()
     return rows
 
 def load_normalized(path, label):
