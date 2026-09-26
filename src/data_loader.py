@@ -2,8 +2,16 @@ from pathlib import Path
 import pandas as pd
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-# BASE = REPO_ROOT / "datasets" / "student_resource" / "student_resource" / "dataset"
-BASE = REPO_ROOT / "student_resource" / "dataset"
+
+# Layout-aware dataset root: local checkout nests student_resource under
+# datasets/, while on Colab the repo root typically sits directly above
+# student_resource/. First existing layout wins, so moving to Colab needs
+# no code change as long as one of these exists.
+_CANDIDATE_BASES = [
+    REPO_ROOT / "datasets" / "student_resource" / "student_resource" / "dataset",
+    REPO_ROOT / "student_resource" / "dataset",
+]
+BASE = next((p for p in _CANDIDATE_BASES if (p / "train").is_dir()), _CANDIDATE_BASES[0])
 
 TRAIN_S1 = BASE / "train" / "train_source1.tsv"
 TRAIN_S2 = BASE / "train" / "train_source2.tsv"

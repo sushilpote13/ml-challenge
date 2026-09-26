@@ -1,5 +1,6 @@
 import gc
 import sys
+from array import array as _array
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -9,6 +10,13 @@ import numpy as np
 from sklearn.feature_extraction.text import TfidfVectorizer
 from src import data_loader as dl
 from src.normalization import add_norm_columns
+
+try:
+    from src.gpu_accelerator import DEVICE, score_candidates_batch
+    _USE_TORCH = True
+except ImportError:
+    DEVICE = "cpu"
+    _USE_TORCH = False
 
 CANDIDATE_HEADER = ["source1_entity_id", "candidate_entity_ids"]
 
@@ -80,7 +88,10 @@ def _add(index_dict, key, pos):
 
 
 def _prune(d, cap, name, label):
-    kept = {k: v for k, v in d.items() if len(v) <= cap}
+    # Build used plain lists (cheap appends); freeze to int32 arrays here:
+    # 4 bytes/entry instead of ~36 bytes for list-of-Python-ints. All
+    # downstream consumers only iterate the values, so no logic changes.
+    kept = {k: _array("i", v) for k, v in d.items() if len(v) <= cap}
     print(f"[{label}] {name}: keys={len(kept):,} "
           f"(dropped {len(d) - len(kept):,} over cap={cap})", flush=True)
     return kept
@@ -116,6 +127,15 @@ def build_index(df, label, min_name_len=3, min_addr_len=2, max_block_size=5000):
     idx.addr_tok = _prune(at, max_block_size, "addr_tok", label)
     idx.country_name = _prune(cn, max_block_size, "country_name", label)
     idx.country_addr = _prune(ca, max_block_size, "country_addr", label)
+    postings = sum(len(v) for d in
+                   (idx.exact_name, idx.exact_compact, idx.name_tok,
+                    idx.addr_tok, idx.country_name, idx.country_addr) for v in d.values())
+    postings_mb = sum(len(v) * v.itemsize for d in
+                      (idx.exact_name, idx.exact_compact, idx.name_tok,
+                       idx.addr_tok, idx.country_name, idx.country_addr)
+                      for v in d.values()) / 1e6
+    print(f"[{label}] index postings={postings:,} "
+          f"(~{postings_mb:,.1f}MB int32 arrays, excl. keys)", flush=True)
     gc.collect()
     return idx
 
@@ -155,13 +175,26 @@ class TfidfSide:
         return self.matrix.shape[0]
 
 
+def _sparse_footprint_mb(mat):
+    m = mat.tocsr()
+    return (m.data.nbytes + m.indices.nbytes + m.indptr.nbytes) / 1e6
+
+
 def build_tfidf(names, label):
     """Fit char n-gram TF-IDF on one source's `name_norm` list. Keeps sparse matrix."""
+    # Guard for tiny corpora (smoke tests/subsets): sklearn requires
+    # max_df * n_docs >= min_df. No-op at real scale (0.5 * 5M >> 2).
+    if 0.5 * len(names) < 2:
+        eff_min_df, eff_max_df = 1, 1.0
+    else:
+        eff_min_df, eff_max_df = 2, 0.5
     vec = TfidfVectorizer(analyzer=TFIDF_ANALYZER, ngram_range=TFIDF_NGRAM_RANGE,
-                          lowercase=False)
+                          lowercase=False, dtype=np.float32,
+                          min_df=eff_min_df, max_df=eff_max_df)
     mat = vec.fit_transform(names).tocsr()
     print(f"[{label}] tfidf: docs={mat.shape[0]:,} features={mat.shape[1]:,} "
-          f"nnz={mat.nnz:,}", flush=True)
+          f"nnz={mat.nnz:,} dtype={mat.dtype} min_df={eff_min_df} max_df={eff_max_df} "
+          f"~{_sparse_footprint_mb(mat):,.1f}MB", flush=True)
     return TfidfSide(vec, mat)
 
 
@@ -193,9 +226,23 @@ def tfidf_topk_restricted(side, q_vec, cand_positions, top_k, min_similarity):
     return [cand_list[j] for j in idx.tolist()]
 
 
+def _score_side_torch(side, names, pools, top_k, min_similarity, group_size):
+    if side is None or top_k <= 0 or not any(pools):
+        return [[] for _ in names]
+    Q = side.vectorizer.transform(names)
+    return score_candidates_batch(Q, side.matrix, pools, top_k, min_similarity, group_size=max(1, int(group_size)))
+
+
+def _score_side_scipy(side, names, pools, top_k, min_similarity):
+    if side is None or top_k <= 0 or not any(pools):
+        return [[] for _ in names]
+    Q = side.vectorizer.transform(names)
+    return [tfidf_topk_restricted(side, Q[j], pool, top_k, min_similarity)
+            for j, pool in enumerate(pools)]
+
+
 def batch_rows(batch, idx2, idx3, rules, min_name_len, min_addr_len, max_per_s1, tf2=None, tf3=None, tfidf_top_k=20, tfidf_min_similarity=0.55, tfidf_query_batch=2000):
     names = [n if isinstance(n, str) else "" for n in batch["name_norm"].tolist()]
-    # Materialize row fields once so sub-batching below stays aligned.
     recs = []
     for row in batch.itertuples(index=False):
         recs.append((
@@ -205,50 +252,50 @@ def batch_rows(batch, idx2, idx3, rules, min_name_len, min_addr_len, max_per_s1,
             row.addr_norm if isinstance(row.addr_norm, str) else "",
             norm_country(row.country),
         ))
-    rows = [None] * len(recs)
+    pools2, pools3 = [], []
+    for (_, nn, nc, an, co) in recs:
+        pools2.append(sorted(candidates_for_row(nn, nc, an, co, idx2, rules, min_name_len, min_addr_len)))
+        pools3.append(sorted(candidates_for_row(nn, nc, an, co, idx3, rules, min_name_len, min_addr_len)))
     use_tfidf = (tf2 is not None or tf3 is not None) and tfidf_top_k > 0
-    qb = max(1, int(tfidf_query_batch))
-    for start in range(0, len(recs), qb):
-        end = min(len(recs), start + qb)
-        sub_names = names[start:end]
-        Q2 = tf2.vectorizer.transform(sub_names) if tf2 is not None else None
-        Q3 = tf3.vectorizer.transform(sub_names) if tf3 is not None else None
-        for j in range(start, end):
-            s1_id, nn, nc, an, co = recs[j]
-            h2 = candidates_for_row(nn, nc, an, co, idx2, rules, min_name_len, min_addr_len)
-            h3 = candidates_for_row(nn, nc, an, co, idx3, rules, min_name_len, min_addr_len)
-            all_ids = {idx2.ids[p] for p in h2} | {idx3.ids[p] for p in h3}
-            if use_tfidf and all_ids:
-                k = j - start
-                # TF-IDF scored ONLY within the blocking pools (no global Q@T).
-                t2 = tfidf_topk_restricted(tf2, Q2[k], h2, tfidf_top_k, tfidf_min_similarity) if tf2 is not None else []
-                t3 = tfidf_topk_restricted(tf3, Q3[k], h3, tfidf_top_k, tfidf_min_similarity) if tf3 is not None else []
-                if t2 or t3:
-                    # Priority (similarity-ordered) used when truncating to max_per_s1.
-                    prio, seen = [], set()
-                    for p in t2:
-                        eid = idx2.ids[p]
-                        if eid not in seen:
-                            seen.add(eid)
-                            prio.append(eid)
-                    for p in t3:
-                        eid = idx3.ids[p]
-                        if eid not in seen:
-                            seen.add(eid)
-                            prio.append(eid)
-                    if len(all_ids) > max_per_s1:
-                        rest = sorted(all_ids - seen)
-                        rows[j] = (s1_id, (prio + rest)[:max_per_s1])
-                        continue
-            cands = sorted(all_ids)
-            if len(cands) > max_per_s1:
-                # No TF-IDF priority available: deterministic sorted truncation.
-                # With TF-IDF priority available this branch is unreachable
-                # (handled above), keeping blocking recall otherwise.
-                cands = cands[:max_per_s1]
-            rows[j] = (s1_id, cands)
-        del Q2, Q3
-        gc.collect()
+    t2_all, t3_all = [[] for _ in recs], [[] for _ in recs]
+    if use_tfidf:
+        scorer = _score_side_torch if _USE_TORCH else _score_side_scipy
+        if tf2 is not None:
+            t2_all = scorer(tf2, names, pools2, tfidf_top_k, tfidf_min_similarity,
+                            tfidf_query_batch)
+        if tf3 is not None:
+            t3_all = scorer(tf3, names, pools3, tfidf_top_k, tfidf_min_similarity,
+                            tfidf_query_batch)
+    rows = [None] * len(recs)
+    for j, (s1_id, nn, nc, an, co) in enumerate(recs):
+        h2, h3 = set(pools2[j]), set(pools3[j])
+        all_ids = {idx2.ids[p] for p in h2} | {idx3.ids[p] for p in h3}
+        if use_tfidf and all_ids:
+            # TF-IDF scored ONLY within the blocking pools (no global Q@T).
+            t2, t3 = t2_all[j], t3_all[j]
+            if t2 or t3:
+                # Priority (similarity-ordered) used when truncating to max_per_s1.
+                prio, seen = [], set()
+                for p in t2:
+                    eid = idx2.ids[p]
+                    if eid not in seen:
+                        seen.add(eid)
+                        prio.append(eid)
+                for p in t3:
+                    eid = idx3.ids[p]
+                    if eid not in seen:
+                        seen.add(eid)
+                        prio.append(eid)
+                if len(all_ids) > max_per_s1:
+                    rest = sorted(all_ids - seen)
+                    rows[j] = (s1_id, (prio + rest)[:max_per_s1])
+                    continue
+        cands = sorted(all_ids)
+        if len(cands) > max_per_s1:
+            cands = cands[:max_per_s1]
+        rows[j] = (s1_id, cands)
+    del pools2, pools3, t2_all, t3_all
+    gc.collect()
     return rows
 
 def load_normalized(path, label):
@@ -262,6 +309,7 @@ def load_normalized(path, label):
 def generate_candidate_pairs(s1_path, s2_path, s3_path, output_path, batch_size=25000, max_block_size=5000, max_per_s1=200, min_name_len=3, min_addr_len=2, rules=ALL_RULES, limit_s1=None, use_tfidf=True, tfidf_top_k=20, tfidf_min_similarity=0.55, tfidf_query_batch=2000):
     rules = tuple(r for r in rules if r in ALL_RULES)
     print(f"rules: {list(rules)} | tfidf={use_tfidf} " f"(top_k={tfidf_top_k}, min_sim={tfidf_min_similarity})", flush=True)
+    print(f"scoring backend: {'torch/' + str(DEVICE) if _USE_TORCH else 'scipy-cpu (torch not installed)'}", flush=True)
 
     df2 = load_normalized(s2_path, "S2")
     idx2 = build_index(df2, "S2", min_name_len, min_addr_len, max_block_size)
@@ -313,7 +361,3 @@ def generate_candidate_pairs(s1_path, s2_path, s3_path, output_path, batch_size=
 
 def generate_train_candidate_pairs(output_path, batch_size=25000, **kwargs):
     return generate_candidate_pairs(dl.TRAIN_S1, dl.TRAIN_S2, dl.TRAIN_S3, output_path, batch_size=batch_size, **kwargs)
-
-
-def generate_test_candidate_pairs(output_path, batch_size=25000, **kwargs):
-    return generate_candidate_pairs(dl.TEST_S1, dl.TEST_S2, dl.TEST_S3, output_path, batch_size=batch_size, **kwargs)
